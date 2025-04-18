@@ -1,0 +1,541 @@
+<?php
+/**
+ * Plugin Name: Sistema de Juego Post-Compra
+ * Description: Implementa una dinámica de juego después de realizar una compra.
+ * Version: 1.1
+ * Author: Tu Nombre
+ */
+
+// Evitar acceso directo
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+class Post_Purchase_Game {
+    
+    private $plugin_path;
+    private $plugin_url;
+    
+    public function __construct() {
+        $this->plugin_path = plugin_dir_path(__FILE__);
+        $this->plugin_url = plugin_dir_url(__FILE__);
+        
+        // Redireccionar después de la compra
+        add_action('woocommerce_thankyou', array($this, 'redirect_to_game_page'), 10);
+        
+        // Registrar endpoints personalizados para el juego
+        add_action('init', array($this, 'register_endpoints'));
+        
+        // AJAX handlers
+        add_action('wp_ajax_play_game', array($this, 'ajax_play_game'));
+        add_action('wp_ajax_nopriv_play_game', array($this, 'handle_not_logged_in'));
+        add_action('wp_ajax_claim_reward', array($this, 'ajax_claim_reward'));
+        add_action('wp_ajax_nopriv_claim_reward', array($this, 'handle_not_logged_in'));
+        
+        // Scripts y estilos
+        add_action('wp_enqueue_scripts', array($this, 'enqueue_scripts'));
+        
+        // Shortcode para mostrar la página del juego
+        add_shortcode('post_purchase_game', array($this, 'game_shortcode'));
+        
+        // Panel de administración
+        add_action('admin_menu', array($this, 'add_admin_menu'));
+        
+        // Crear tablas personalizadas en la activación
+        register_activation_hook(__FILE__, array($this, 'create_tables'));
+    }
+    
+    // Registrar endpoints personalizados
+    public function register_endpoints() {
+        add_rewrite_endpoint('post-purchase-game', EP_PAGES);
+        add_rewrite_rule('^post-purchase-game/([0-9]+)/?', 'index.php?page_id=$matches[1]&post-purchase-game=1', 'top');
+        flush_rewrite_rules();
+    }
+    
+    // Crear tablas personalizadas
+    public function create_tables() {
+        global $wpdb;
+        $charset_collate = $wpdb->get_charset_collate();
+        
+        // Tabla para el registro de actividad del juego
+        $table_name = $wpdb->prefix . 'game_activity_log';
+        $sql = "CREATE TABLE $table_name (
+            id mediumint(9) NOT NULL AUTO_INCREMENT,
+            time datetime DEFAULT CURRENT_TIMESTAMP NOT NULL,
+            user_id bigint(20) NOT NULL,
+            order_id bigint(20) NOT NULL,
+            action varchar(50) NOT NULL,
+            result varchar(50) DEFAULT '' NOT NULL,
+            percentage int(3) DEFAULT 0 NOT NULL,
+            amount decimal(10,2) DEFAULT 0 NOT NULL,
+            ip varchar(100) NOT NULL,
+            PRIMARY KEY  (id)
+        ) $charset_collate;";
+        
+        // Tabla para estadísticas generales
+        $stats_table = $wpdb->prefix . 'game_statistics';
+        $stats_sql = "CREATE TABLE $stats_table (
+            id mediumint(9) NOT NULL AUTO_INCREMENT,
+            date date DEFAULT CURRENT_DATE NOT NULL,
+            games_played int DEFAULT 0 NOT NULL,
+            rewards_claimed int DEFAULT 0 NOT NULL,
+            total_reward_amount decimal(10,2) DEFAULT 0 NOT NULL,
+            avg_percentage decimal(5,2) DEFAULT 0 NOT NULL,
+            PRIMARY KEY  (id),
+            UNIQUE KEY date (date)
+        ) $charset_collate;";
+        
+        require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+        dbDelta($sql);
+        dbDelta($stats_sql);
+        
+        // Crear página del juego si no existe
+        $this->create_game_page();
+    }
+    
+    // Redireccionar después de la compra
+    public function redirect_to_game_page($order_id) {
+        if (!$order_id) return;
+        
+        // Verificar que la orden sea válida
+        $order = wc_get_order($order_id);
+        if (!$order) return;
+        
+        // Verificar si el juego ya se ha jugado para esta orden
+        $game_played = $order->get_meta('_post_purchase_game_played');
+        if ($game_played === 'yes') return;
+        
+        // Calcular el 1% del valor de la compra
+        $order_total = $order->get_total();
+        $initial_reward = $order_total * 0.01;
+        
+        // Guardar temporalmente el valor en la sesión y en la orden
+        WC()->session->set('post_purchase_game_order_id', $order_id);
+        WC()->session->set('post_purchase_game_initial_reward', $initial_reward);
+        WC()->session->set('post_purchase_game_current_percentage', 1);
+        
+        // Guardar en meta datos de la orden
+        $order->update_meta_data('_post_purchase_game_played', 'no');
+        $order->update_meta_data('_post_purchase_game_initial_reward', $initial_reward);
+        $order->save();
+        
+        // Redireccionar a la página del juego
+        $game_page_id = get_option('post_purchase_game_page_id');
+        if ($game_page_id) {
+            wp_redirect(get_permalink($game_page_id) . '?order_id=' . $order_id);
+            exit;
+        }
+    }
+    
+    // Enqueue scripts y estilos
+    public function enqueue_scripts() {
+        // Solo cargar en la página del juego
+        global $post;
+        $game_page_id = get_option('post_purchase_game_page_id');
+        
+        if ($post && ($post->ID == $game_page_id || has_shortcode($post->post_content, 'post_purchase_game'))) {
+            // CSS
+            wp_enqueue_style('post-purchase-game-css', $this->plugin_url . 'assets/css/game.css', array(), '1.1.0');
+            
+            // Main JS
+            wp_enqueue_script('howler-js', 'https://cdnjs.cloudflare.com/ajax/libs/howler/2.2.3/howler.min.js', array(), '2.2.3', true);
+            wp_enqueue_script('post-purchase-game-js', $this->plugin_url . 'assets/js/game.js', array('jquery', 'howler-js'), '1.1.0', true);
+            
+            // Localize script
+            wp_localize_script('post-purchase-game-js', 'post_purchase_game', array(
+                'ajax_url' => admin_url('admin-ajax.php'),
+                'nonce' => wp_create_nonce('post-purchase-game-nonce'),
+                'sounds_url' => $this->plugin_url . 'assets/sounds/',
+                'images_url' => $this->plugin_url . 'assets/images/',
+            ));
+        }
+    }
+    
+    // Handler para usuarios no logueados
+    public function handle_not_logged_in() {
+        wp_send_json_error(array('message' => 'Debes iniciar sesión para jugar'));
+    }
+    
+    // Shortcode para mostrar la página del juego
+    public function game_shortcode($atts) {
+        // Verificar si hay un order_id válido
+        $order_id = isset($_GET['order_id']) ? intval($_GET['order_id']) : WC()->session->get('post_purchase_game_order_id');
+        
+        if (!$order_id) {
+            return '<p>No se encontró ninguna orden válida.</p>';
+        }
+        
+        $order = wc_get_order($order_id);
+        if (!$order) {
+            return '<p>No se encontró ninguna orden válida.</p>';
+        }
+        
+        // Verificar que el usuario actual sea el propietario de la orden
+        $customer_id = $order->get_customer_id();
+        $current_user_id = get_current_user_id();
+        
+        if ($customer_id && $customer_id != $current_user_id) {
+            return '<p>No tienes permiso para acceder a esta página.</p>';
+        }
+        
+        // Verificar si el juego ya se jugó para esta orden
+        $game_played = $order->get_meta('_post_purchase_game_played');
+        if ($game_played === 'yes') {
+            $coupon_code = $order->get_meta('_post_purchase_game_reward_coupon');
+            $final_percentage = $order->get_meta('_post_purchase_game_final_percentage');
+            $order_total = $order->get_total();
+            $reward_amount = $order_total * ($final_percentage / 100);
+            
+            return $this->render_reward_claimed_template($coupon_code, $reward_amount);
+        }
+        
+        $order_total = $order->get_total();
+        $initial_reward = $order_total * 0.01;
+        $current_percentage = WC()->session->get('post_purchase_game_current_percentage', 1);
+        $current_reward = $order_total * ($current_percentage / 100);
+        
+        ob_start();
+        include($this->plugin_path . 'templates/game-page.php');
+        return ob_get_clean();
+    }
+    
+    // Template para mostrar cuando ya se ha reclamado la recompensa
+    private function render_reward_claimed_template($coupon_code, $reward_amount) {
+        ob_start();
+        ?>
+        <div class="post-purchase-game-container">
+            <div class="reward-success">
+                <h2>¡Recompensa reclamada!</h2>
+                <p>Has obtenido un cupón de <?php echo wc_price($reward_amount); ?> para tu próxima compra.</p>
+                <div class="coupon-info">
+                    <p>Tu código de cupón: <strong><?php echo esc_html($coupon_code); ?></strong></p>
+                    <p>Este cupón se aplicará automáticamente en tu próxima compra.</p>
+                </div>
+                <a href="<?php echo esc_url(wc_get_page_permalink('shop')); ?>" class="button button-primary">Volver a la tienda</a>
+            </div>
+        </div>
+        <?php
+        return ob_get_clean();
+    }
+    
+    // AJAX handler para jugar
+    public function ajax_play_game() {
+        check_ajax_referer('post-purchase-game-nonce', 'nonce');
+        
+        $order_id = isset($_POST['order_id']) ? intval($_POST['order_id']) : 0;
+        $current_percentage = isset($_POST['current_percentage']) ? intval($_POST['current_percentage']) : 1;
+        
+        if (!$order_id) {
+            wp_send_json_error(array('message' => 'Orden no válida'));
+        }
+        
+        $order = wc_get_order($order_id);
+        if (!$order) {
+            wp_send_json_error(array('message' => 'Orden no encontrada'));
+        }
+        
+        // Verificar que el usuario actual sea el propietario de la orden
+        $customer_id = $order->get_customer_id();
+        $current_user_id = get_current_user_id();
+        
+        if (!$current_user_id || ($customer_id && $customer_id != $current_user_id)) {
+            wp_send_json_error(array('message' => 'No autorizado'));
+        }
+        
+        // Verificar que el juego no se haya jugado ya
+        if ($order->get_meta('_post_purchase_game_played') === 'yes') {
+            wp_send_json_error(array('message' => 'Este juego ya se ha jugado'));
+        }
+        
+        // Verificar tiempo entre juegos para prevenir abusos
+        $last_play_time = get_user_meta($current_user_id, '_last_game_play_time', true);
+        $now = time();
+        if ($last_play_time && ($now - $last_play_time) < 2) { // 2 segundos mínimo entre juegos
+            wp_send_json_error(array('message' => 'Estás jugando demasiado rápido, espera un momento'));
+        }
+        update_user_meta($current_user_id, '_last_game_play_time', $now);
+        
+        // Determinar el resultado (servidor)
+        $random = mt_rand(1, 100);
+        
+        // Definir los niveles de comisión
+        $commission_levels = array(1, 2, 4, 8, 15, 30, 50, 100);
+        $current_level_index = array_search($current_percentage, $commission_levels);
+        
+        if ($random <= 33) {
+            // Avanza al siguiente nivel
+            $result = 'advance';
+            $next_level_index = min($current_level_index + 1, count($commission_levels) - 1);
+            $next_percentage = $commission_levels[$next_level_index];
+            
+            WC()->session->set('post_purchase_game_current_percentage', $next_percentage);
+            
+            // Registrar actividad
+            $this->log_game_activity($current_user_id, $order_id, 'play', $result, $next_percentage);
+            
+            wp_send_json_success(array(
+                'result' => $result,
+                'message' => '¡Felicidades! Has avanzado al ' . $next_percentage . '% de comisión.',
+                'new_percentage' => $next_percentage,
+                'segment_index' => mt_rand(0, 3) // Para que caiga en uno de los 4 segmentos de "Avanzar"
+            ));
+        } elseif ($random <= 66) {
+            // Repetir
+            $result = 'repeat';
+            
+            // Registrar actividad
+            $this->log_game_activity($current_user_id, $order_id, 'play', $result, $current_percentage);
+            
+            wp_send_json_success(array(
+                'result' => $result,
+                'message' => 'Puedes volver a intentarlo.',
+                'new_percentage' => $current_percentage,
+                'segment_index' => mt_rand(4, 7) // Para que caiga en uno de los 4 segmentos de "Repetir"
+            ));
+        } else {
+            // Perder todo
+            $result = 'lose';
+            WC()->session->set('post_purchase_game_current_percentage', 0);
+            
+            // Registrar actividad
+            $this->log_game_activity($current_user_id, $order_id, 'play', $result, 0);
+            
+            wp_send_json_success(array(
+                'result' => $result,
+                'message' => 'Has perdido tu comisión acumulada.',
+                'new_percentage' => 0,
+                'segment_index' => mt_rand(8, 11) // Para que caiga en uno de los 4 segmentos de "Perder"
+            ));
+        }
+    }
+    
+    // AJAX handler para reclamar recompensa
+    public function ajax_claim_reward() {
+        check_ajax_referer('post-purchase-game-nonce', 'nonce');
+        
+        $order_id = isset($_POST['order_id']) ? intval($_POST['order_id']) : 0;
+        $current_percentage = isset($_POST['current_percentage']) ? intval($_POST['current_percentage']) : 1;
+        
+        if (!$order_id) {
+            wp_send_json_error(array('message' => 'Orden no válida'));
+        }
+        
+        $order = wc_get_order($order_id);
+        if (!$order) {
+            wp_send_json_error(array('message' => 'Orden no encontrada'));
+        }
+        
+        // Verificar que el usuario actual sea el propietario de la orden
+        $customer_id = $order->get_customer_id();
+        $current_user_id = get_current_user_id();
+        
+        if (!$current_user_id || ($customer_id && $customer_id != $current_user_id)) {
+            wp_send_json_error(array('message' => 'No autorizado'));
+        }
+        
+        // Verificar que el juego no se haya jugado ya
+        if ($order->get_meta('_post_purchase_game_played') === 'yes') {
+            wp_send_json_error(array('message' => 'Este juego ya se ha jugado'));
+        }
+        
+        $order_total = $order->get_total();
+        $reward_amount = $order_total * ($current_percentage / 100);
+        
+        // Crear un cupón único para el cliente
+        if ($customer_id) {
+            $customer = new WC_Customer($customer_id);
+            $coupon_code = 'reward_' . $customer_id . '_' . $order_id . '_' . time();
+            $coupon = array(
+                'post_title' => $coupon_code,
+                'post_content' => '',
+                'post_status' => 'publish',
+                'post_author' => 1,
+                'post_type' => 'shop_coupon'
+            );
+            
+            $new_coupon_id = wp_insert_post($coupon);
+            
+            // Configurar el cupón
+            update_post_meta($new_coupon_id, 'discount_type', 'fixed_cart');
+            update_post_meta($new_coupon_id, 'coupon_amount', $reward_amount);
+            update_post_meta($new_coupon_id, 'individual_use', 'yes');
+            update_post_meta($new_coupon_id, 'usage_limit', '1');
+            update_post_meta($new_coupon_id, 'usage_limit_per_user', '1');
+            update_post_meta($new_coupon_id, 'customer_email', array($customer->get_email()));
+            update_post_meta($new_coupon_id, 'date_expires', strtotime('+30 days'));
+            
+            // Marcar la orden como jugada
+            $order->update_meta_data('_post_purchase_game_played', 'yes');
+            $order->update_meta_data('_post_purchase_game_final_percentage', $current_percentage);
+            $order->update_meta_data('_post_purchase_game_reward_coupon', $coupon_code);
+            $order->update_meta_data('_post_purchase_game_reward_amount', $reward_amount);
+            $order->save();
+            
+            // Guardar cupón en el perfil del cliente
+            $saved_coupons = get_user_meta($customer_id, '_saved_reward_coupons', true);
+            if (!$saved_coupons) {
+                $saved_coupons = array();
+            }
+            
+            $saved_coupons[] = array(
+                'code' => $coupon_code,
+                'amount' => $reward_amount,
+                'order_id' => $order_id,
+                'created' => time(),
+                'expiry' => strtotime('+30 days')
+            );
+            
+            update_user_meta($customer_id, '_saved_reward_coupons', $saved_coupons);
+            
+            // Registrar actividad
+            $this->log_game_activity($customer_id, $order_id, 'claim', 'success', $current_percentage, $reward_amount);
+            
+            // Actualizar estadísticas
+            $this->update_statistics('reward_claimed', $reward_amount, $current_percentage);
+            
+            wp_send_json_success(array(
+                'message' => '¡Has obtenido un cupón de ' . wc_price($reward_amount) . ' para tu próxima compra!',
+                'coupon_code' => $coupon_code,
+                'amount' => $reward_amount
+            ));
+        } else {
+            wp_send_json_error(array('message' => 'No se pudo crear un cupón para este cliente'));
+        }
+    }
+    
+    // Registrar actividad del juego
+    private function log_game_activity($user_id, $order_id, $action, $result, $percentage, $amount = 0) {
+        global $wpdb;
+        $table_name = $wpdb->prefix . 'game_activity_log';
+        
+        $data = array(
+            'user_id' => $user_id,
+            'order_id' => $order_id,
+            'action' => $action,
+            'result' => $result,
+            'percentage' => $percentage,
+            'amount' => $amount,
+            'ip' => $this->get_client_ip()
+        );
+        
+        $wpdb->insert($table_name, $data);
+        
+        // Si es una acción de juego, actualizamos estadísticas
+        if ($action === 'play') {
+            $this->update_statistics('game_played');
+        }
+    }
+    
+    // Obtener IP del cliente de forma segura
+    private function get_client_ip() {
+        $ip = '';
+        
+        if (isset($_SERVER['HTTP_CLIENT_IP']))
+            $ip = $_SERVER['HTTP_CLIENT_IP'];
+        else if(isset($_SERVER['HTTP_X_FORWARDED_FOR']))
+            $ip = $_SERVER['HTTP_X_FORWARDED_FOR'];
+        else if(isset($_SERVER['HTTP_X_FORWARDED']))
+            $ip = $_SERVER['HTTP_X_FORWARDED'];
+        else if(isset($_SERVER['HTTP_FORWARDED_FOR']))
+            $ip = $_SERVER['HTTP_FORWARDED_FOR'];
+        else if(isset($_SERVER['HTTP_FORWARDED']))
+            $ip = $_SERVER['HTTP_FORWARDED'];
+        else if(isset($_SERVER['REMOTE_ADDR']))
+            $ip = $_SERVER['REMOTE_ADDR'];
+        
+        // Sanitizar IP
+        $ip = filter_var($ip, FILTER_VALIDATE_IP);
+        return $ip ?: 'unknown';
+    }
+    
+    // Actualizar estadísticas
+    private function update_statistics($stat_type, $amount = 0, $percentage = 0) {
+        global $wpdb;
+        $table_name = $wpdb->prefix . 'game_statistics';
+        $today = current_time('Y-m-d');
+        
+        // Verificar si ya existe un registro para hoy
+        $exists = $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM $table_name WHERE date = %s",
+            $today
+        ));
+        
+        if ($exists) {
+            // Actualizar registro existente
+            if ($stat_type === 'game_played') {
+                $wpdb->query($wpdb->prepare(
+                    "UPDATE $table_name SET games_played = games_played + 1 WHERE date = %s",
+                    $today
+                ));
+            } else if ($stat_type === 'reward_claimed') {
+                $wpdb->query($wpdb->prepare(
+                    "UPDATE $table_name 
+                    SET rewards_claimed = rewards_claimed + 1, 
+                        total_reward_amount = total_reward_amount + %f,
+                        avg_percentage = ((avg_percentage * rewards_claimed) + %f) / (rewards_claimed + 1)
+                    WHERE date = %s",
+                    $amount,
+                    $percentage,
+                    $today
+                ));
+            }
+        } else {
+            // Crear nuevo registro
+            $data = array(
+                'date' => $today,
+                'games_played' => $stat_type === 'game_played' ? 1 : 0,
+                'rewards_claimed' => $stat_type === 'reward_claimed' ? 1 : 0,
+                'total_reward_amount' => $stat_type === 'reward_claimed' ? $amount : 0,
+                'avg_percentage' => $stat_type === 'reward_claimed' ? $percentage : 0
+            );
+            
+            $wpdb->insert($table_name, $data);
+        }
+    }
+    
+    // Crear página del juego
+    private function create_game_page() {
+        // Verificar si ya existe la página
+        $existing_page = get_page_by_title('Post-Purchase Game');
+        
+        if (!$existing_page) {
+            // Crear nueva página
+            $page_data = array(
+                'post_title' => 'Post-Purchase Game',
+                'post_content' => '[post_purchase_game]',
+                'post_status' => 'publish',
+                'post_type' => 'page',
+                'post_author' => 1
+            );
+            
+            $page_id = wp_insert_post($page_data);
+            
+            if ($page_id) {
+                update_option('post_purchase_game_page_id', $page_id);
+            }
+        } else {
+            update_option('post_purchase_game_page_id', $existing_page->ID);
+        }
+    }
+    
+    // Añadir menú de administración
+    public function add_admin_menu() {
+        add_menu_page(
+            'Post-Purchase Game', 
+            'Game Stats', 
+            'manage_options', 
+            'post-purchase-game', 
+            array($this, 'admin_page'),
+            'dashicons-games', 
+            30
+        );
+    }
+    
+    // Página de administración
+    public function admin_page() {
+        include($this->plugin_path . 'templates/admin-page.php');
+    }
+}
+
+// Inicializar la clase
+$post_purchase_game = new Post_Purchase_Game();
